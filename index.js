@@ -13,7 +13,22 @@ program
   .requiredOption('-b, --batch-size <batchSize>', 'Batch size', parseInt)
   .requiredOption('-p, --patch-file <file>', 'File with patch data (JSON format)')
   .option('-f, --filter <file>', 'JavaScript file for filtering resources')
-  .option('--resource-name-same-as-namespace', 'Use the namespace as the resource name');
+  .option('--resource-name-same-as-namespace', 'Use the namespace as the resource name')
+  .on('--help', () => {
+    console.log('Flags:');
+    console.log('-n, --name <name>', 'Resource name');
+    console.log('-ns, --namespace <namespace>', 'Namespace');
+    console.log('-A, --all-namespaces', 'Patch all namespaces');
+    console.log('-b, --batch-size <batchSize>', 'Batch size', parseInt)
+    console.log('-p, --patch-file <file>', 'File with patch data (JSON format)');
+    console.log('-f, --filter <file>', 'JavaScript file for filtering resources');
+    console.log('--resource-name-same-as-namespace', 'Use the namespace as the resource name');
+    console.log('');
+    console.log('Examples:');
+    console.log('  node index.js -t deployment -ns default -b 2 -p patch.json');
+    console.log('  node index.js -t pod -A -b 5 -p patch.json -f filter.js');
+    console.log('  node index.js -t service --resource-name-same-as-namespace -A -b 3 -p patch.json');
+  });
 
 program.parse(process.argv);
 
