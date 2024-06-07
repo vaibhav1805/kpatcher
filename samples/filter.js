@@ -1,8 +1,6 @@
-function filter(resource) {
-    const spec = resource.spec;
-    const labels = resource.metadata.labels;
-    return (labels && labels["type"] === "service") && (spec && spec["revisionHistoryLimit"] == 2);
+function filterResources(resources) {
+    let filtered =  resources.filter(resource => {
+        return resource["metadata"]["annotations"] && resource["metadata"]["annotations"]["kpatch"] === "enabled";
+    });
+    return JSON.stringify(filtered)
 }
-  
-// Export the filter function
-filter;
