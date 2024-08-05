@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,28 +20,116 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-func main() {
-	// Command-line arguments
-	var kubeconfig string
-	var resource string
-	var filterFile string
-	var patchFile string
+const (
+	TypeFilter       = "filter"
+	TypePatch        = "patch"
+	TypePatchDynamic = "dynamic"
+)
+
+type JSRunner struct {
+	VM               node.VM
+	logger           *log.Logger
+	filterFile       string
+	patchFile        string
+	dynamicPatchFile string
+}
+
+func NewJSRunner(logger *log.Logger, filterFile, patchFile, dynamicPatchFile string) *JSRunner {
+	vm := node.New(&node.Options{OnError: func(msg string) {
+		logger.Panic("failed to create JavaScript VM")
+	}})
+
+	return &JSRunner{
+		VM:               vm,
+		logger:           logger,
+		filterFile:       filterFile,
+		patchFile:        patchFile,
+		dynamicPatchFile: dynamicPatchFile,
+	}
+}
+
+func (j *JSRunner) readScript(file string) ([]byte, error) {
+	script, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	return script, nil
+}
+
+func (j *JSRunner) executeCode(codeType string, data string) (string, error) {
+	code := ""
+	switch codeType {
+	case TypeFilter:
+		file := j.filterFile
+		script, err := j.readScript(file)
+		if err != nil {
+			return "", err
+		}
+		code = string(script) + `
+			filterResources(JSON.parse(` + "`" + data + "`" + `));
+		`
+	case TypePatchDynamic:
+		// Todo add logic for data loader
+		file := j.dynamicPatchFile
+		script, err := j.readScript(file)
+		if err != nil {
+			return "", err
+		}
+		code = string(script) + `
+			createDynamicPatch(` + "'" + data + "'" + `);
+		`
+	case TypePatch:
+		file := j.patchFile
+		script, err := j.readScript(file)
+		if err != nil {
+			return "", err
+		}
+		return string(script), nil
+	}
+
+	result := j.VM.Run(code)
+	if result.Error() != nil {
+		return "", result.Error()
+	}
+	return result.String(), nil
+}
+
+type KPatcher struct {
+	ctx       context.Context
+	logger    *log.Logger
+	client    dynamic.NamespaceableResourceInterface
+	gvr       schema.GroupVersionResource
+	jsRunner  *JSRunner
+	patch     []byte
+	patchType string
+}
+
+func NewKPatcher() (*KPatcher, error) {
+	var (
+		kubeconfig       string
+		resource         string
+		filterFile       string
+		patchFile        string
+		dynamicPatchFile string
+	)
+
+	logger := log.New(os.Stderr, "kpatcher", log.LstdFlags)
 
 	flag.StringVar(&kubeconfig, "kubeconfig", filepath.Join(homeDir(), ".kube", "config"), "Path to the kubeconfig file")
 	flag.StringVar(&resource, "resource", "", "Resource type (e.g., deployments.v1.apps)")
 	flag.StringVar(&filterFile, "filter", "", "Path to the filter JavaScript file")
 	flag.StringVar(&patchFile, "patch", "", "Path to the patch JSON file")
+	flag.StringVar(&dynamicPatchFile, "dynamic-patch", "", "Path to the patch Javascript file which returns patch json")
 	flag.Parse()
 
-	if resource == "" || filterFile == "" || patchFile == "" {
-		fmt.Println("resource, filter, and patch are required arguments")
-		return
+	if resource == "" || filterFile == "" || (patchFile == "" && dynamicPatchFile == "") {
+		fmt.Println("resource, filter, and patch/dynamic-patch required arguments")
+		return &KPatcher{}, errors.New("missing required arguments")
 	}
 
-	// Load patch JSON file
-	patch, err := ioutil.ReadFile(patchFile)
-	if err != nil {
-		panic(err.Error())
+	patchType := TypePatch
+	if dynamicPatchFile != "" {
+		patchType = TypePatchDynamic
 	}
 
 	// Load kubeconfig file
@@ -58,8 +147,8 @@ func main() {
 	// Parse the resource type
 	parts := strings.Split(resource, ".")
 	if len(parts) != 3 {
-		fmt.Println("resource should be in the format <resource>.<version>.<group>")
-		return
+		log.Print("resource should be in the format <resource>.<version>.<group>")
+		return &KPatcher{}, errors.New("invalid resource format")
 	}
 
 	resourceType := parts[0]
@@ -75,11 +164,27 @@ func main() {
 
 	// List all resources in all namespaces
 	resourceClient := dynamicClient.Resource(gvr)
-	list, err := resourceClient.List(context.TODO(), metav1.ListOptions{})
+
+	// Initialise JS runner
+	jsRunner := NewJSRunner(logger, filterFile, patchFile, dynamicPatchFile)
+
+	return &KPatcher{
+		ctx:       context.TODO(),
+		logger:    logger,
+		client:    resourceClient,
+		gvr:       gvr,
+		jsRunner:  jsRunner,
+		patchType: patchType,
+	}, nil
+}
+
+func (k *KPatcher) list() (*unstructured.UnstructuredList, error) {
+	list, err := k.client.List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		panic(err.Error())
 	}
 
+	// Remove manged stuff which messes up json un/marshalling
 	for _, item := range list.Items {
 		item.SetManagedFields([]metav1.ManagedFieldsEntry{})
 		annotations := item.GetAnnotations()
@@ -87,55 +192,56 @@ func main() {
 		item.SetAnnotations(annotations)
 		item.Object["status"] = map[string]interface{}{}
 	}
+	return list, nil
+}
 
-	// Convert list items to JSON
+func (k *KPatcher) filter(list *unstructured.UnstructuredList) ([]map[string]interface{}, error) {
 	listData, err := json.Marshal(list.Items)
 	if err != nil {
 		panic(err.Error())
 	}
-
-	// Load and execute the JavaScript filter file
-	filterScript, err := ioutil.ReadFile(filterFile)
+	result, err := k.jsRunner.executeCode(TypeFilter, string(listData))
 	if err != nil {
-		panic(err.Error())
+		return nil, err
 	}
 
-	// Create a new JavaScript VM
-	vm := node.New(&node.Options{OnError: func(msg string) {
-		log.Printf("failed to create VM, %s", msg)
-	}})
-
-	// Define the filter function in JavaScript
-	jsFilterScript := string(filterScript)
-
-	// Execute the filter function
-	jsCode := jsFilterScript + `
-		filterResources(JSON.parse(` + "`" + string(listData) + "`" + `));
-	`
-
-	// Run the JavaScript code and get the result
-	result := vm.Run(jsCode)
-	if result.Error() != nil {
-		panic(result.Error())
-	}
-
-	// Parse the filtered result
 	var filteredItems []map[string]interface{}
-	if err := json.Unmarshal([]byte(result.String()), &filteredItems); err != nil {
+	if err := json.Unmarshal([]byte(result), &filteredItems); err != nil {
 		panic(err.Error())
+	}
+
+	return filteredItems, nil
+}
+
+func (k *KPatcher) execute() error {
+	list, err := k.list()
+	if err != nil {
+		return err
+	}
+
+	filteredItems, err := k.filter(list)
+	if err != nil {
+		return err
 	}
 
 	// Apply the patch to each filtered resource
+	// Todo: Implement concurrent patching parallel
 	for _, item := range filteredItems {
 		name := item["metadata"].(map[string]interface{})["name"].(string)
 		namespace := item["metadata"].(map[string]interface{})["namespace"].(string)
 
-		_, err := resourceClient.Namespace(namespace).Patch(context.TODO(), name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+		patch, err := k.jsRunner.executeCode(k.patchType, name)
+		if err != nil {
+			return err
+		}
+
+		_, err = k.client.Namespace(namespace).Patch(context.TODO(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
 		if err != nil {
 			panic(err.Error())
 		}
-		fmt.Printf("Patched resource %q in namespace %q of type %q.\n", name, namespace, resource)
+		fmt.Printf("Patched resource %q in namespace %q of type %q.\n", name, namespace, k.gvr.Resource)
 	}
+	return nil
 }
 
 func homeDir() string {
@@ -143,4 +249,15 @@ func homeDir() string {
 		return h
 	}
 	return os.Getenv("USERPROFILE") // windows
+}
+
+func main() {
+	patcher, err := NewKPatcher()
+	if err != nil {
+		log.Fatalf("failed to create patcher, %v", err)
+	}
+
+	if err = patcher.execute(); err != nil {
+		log.Fatalf("failed to patch resource, %v", err)
+	}
 }

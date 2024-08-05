@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: 865d1063-de8e-4013-aaff-1cf916f5379a
+  name: deployment-4
   annotations:
     kpatch: "enabled"
 spec:
