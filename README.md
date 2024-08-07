@@ -1,6 +1,13 @@
 # Kpatcher
 For filtering & patching k8s resources at scale.
 
+# Installation
+```shell
+brew tap vaibhav1805/kpatcher
+brew install kpatcher
+```
+
+
 # Run Locally
 ```shell
 git clone https://github.com/vaibhav1805/kpatcher.git
