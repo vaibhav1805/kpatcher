@@ -18,10 +18,12 @@ cd kpatcher
 
 ```
 Options:
-  -r, --resource <resource>          Resource group
-  -p, --patch <file>                 File with patch data (JSON format)
-  -f, --filter <file>                JavaScript file for filtering resources
-  -h, --help                         display help for command
+  --resource <resource>          Resource group
+  --patch <file>                 File with patch data (JSON format)
+  --filter <file>                JavaScript file for filtering resources
+  --dynamic-patch <file>         Path to the patch Javascript file which returns patch json
+  --batch-size <int>             Number of resources to patch concurrently in each batch
+  --help                         display help for command
 ```
 ## Static Patch
 Applying a constant patch across all resources. Example usage

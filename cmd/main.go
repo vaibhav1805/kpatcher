@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/tidwall/go-node"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,6 +103,7 @@ type KPatcher struct {
 	jsRunner  *JSRunner
 	patch     []byte
 	patchType string
+	batchSize int
 }
 
 func NewKPatcher() (*KPatcher, error) {
@@ -111,6 +113,7 @@ func NewKPatcher() (*KPatcher, error) {
 		filterFile       string
 		patchFile        string
 		dynamicPatchFile string
+		batchSize        int
 	)
 
 	logger := log.New(os.Stderr, "kpatcher", log.LstdFlags)
@@ -120,6 +123,7 @@ func NewKPatcher() (*KPatcher, error) {
 	flag.StringVar(&filterFile, "filter", "", "Path to the filter JavaScript file")
 	flag.StringVar(&patchFile, "patch", "", "Path to the patch JSON file")
 	flag.StringVar(&dynamicPatchFile, "dynamic-patch", "", "Path to the patch Javascript file which returns patch json")
+	flag.IntVar(&batchSize, "batch-size", 5, "Number of resources to patch concurrently in each batch")
 	flag.Parse()
 
 	if resource == "" || filterFile == "" || (patchFile == "" && dynamicPatchFile == "") {
@@ -175,6 +179,7 @@ func NewKPatcher() (*KPatcher, error) {
 		gvr:       gvr,
 		jsRunner:  jsRunner,
 		patchType: patchType,
+		batchSize: batchSize,
 	}, nil
 }
 
@@ -225,21 +230,32 @@ func (k *KPatcher) execute() error {
 	}
 
 	// Apply the patch to each filtered resource
-	// Todo: Implement concurrent patching parallel
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, k.batchSize)
+
 	for _, item := range filteredItems {
-		name := item["metadata"].(map[string]interface{})["name"].(string)
-		namespace := item["metadata"].(map[string]interface{})["namespace"].(string)
+		wg.Add(1)
+		sem <- struct{}{}
 
-		patch, err := k.jsRunner.executeCode(k.patchType, name)
-		if err != nil {
-			return err
-		}
+		go func(item map[string]interface{}) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		_, err = k.client.Namespace(namespace).Patch(context.TODO(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
-		if err != nil {
-			panic(err.Error())
-		}
-		fmt.Printf("Patched resource %q in namespace %q of type %q.\n", name, namespace, k.gvr.Resource)
+			name := item["metadata"].(map[string]interface{})["name"].(string)
+			namespace := item["metadata"].(map[string]interface{})["namespace"].(string)
+
+			patch, err := k.jsRunner.executeCode(k.patchType, name)
+			if err != nil {
+				log.Print(fmt.Errorf("failed to create patch for the resource: %s, error: %w", name, err))
+			}
+
+			_, err = k.client.Namespace(namespace).Patch(context.TODO(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+			if err != nil {
+				log.Print(fmt.Errorf("failed to patch the resource: %s, error: %w", name, err))
+			}
+			fmt.Printf("Patched resource %q in namespace %q of type %q.\n", name, namespace, k.gvr.Resource)
+		}(item)
+		wg.Wait()
 	}
 	return nil
 }
